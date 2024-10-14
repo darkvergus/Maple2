@@ -9,12 +9,23 @@ function Invoke-Dotnet {
 
         [Parameter(Mandatory = $true)]
         [System.String]
-        $Arguments
+        $Arguments,
+
+        [Parameter(Mandatory = $false)]
+        [System.String]
+        $WorkingDirectory
     )
+    
+    $originalLocation = Get-Location
+
+    # Set the working directory if provided
+    if ($WorkingDirectory) {
+        Set-Location -Path $WorkingDirectory
+    }
 
     $DotnetArgs = @()
-    $DotnetArgs = $DotnetArgs + $Command
-    $DotnetArgs = $DotnetArgs + ($Arguments -split "\s+")
+    $DotnetArgs += $Command
+    $DotnetArgs += ($Arguments -split "\s+")
 
     & dotnet $DotnetArgs | Tee-Object -Variable Output
 
@@ -23,8 +34,66 @@ function Invoke-Dotnet {
         Write-Warning -Message ($Output -join "; ")
         throw "There was an issue running the specified dotnet command."
     }
+
+    # Return to the original location
+    Set-Location -Path $originalLocation
 }
 
+# Function to update or add entries in the .env file if values differ
+function Update-EnvVariable {
+    param (
+        [string]$key,
+        [string]$newValue
+    )
+
+    # Read the entire .env file once
+    $envContent = Get-Content .env
+
+    # Check for existing value
+    $existingLine = $envContent | Select-String -Pattern "$key="
+
+    if ($existingLine) {
+        # Extract the existing value
+        $existingValue = $existingLine -replace "$key=", "" -replace "\s+", ""
+
+        # Compare and update if necessary
+        if ($existingValue -ne $newValue) {
+            $envContent = $envContent -replace "$key=.*", "$key=$newValue"
+            Write-Host "$key updated to $newValue." -ForegroundColor Green
+            # Write back the modified content to the file
+            Set-Content .env $envContent
+        } else {
+            Write-Host "No change for $key, keeping existing value." -ForegroundColor Yellow
+            return # Skip the update to the file
+        }
+    } else {
+        # If the key does not exist, add it
+        $envContent += "$key=$newValue"
+        Write-Host "$key added with value $newValue." -ForegroundColor Green
+        # Write back the modified content to the file
+        Set-Content .env $envContent
+    }
+}
+
+# Function to prompt for executable and set up data directory
+function Get-ClientExecutable {
+    # File browser dialog to get the path to the client
+    $FileBrowser = New-Object System.Windows.Forms.OpenFileDialog -Property @{
+        InitialDirectory = [Environment]::GetFolderPath('Desktop')
+        Filter = "MapleStory2.exe|MapleStory2.exe"
+        Title = "Maplestory2 Executable"
+    }
+    $null = $FileBrowser.ShowDialog()
+
+    $exePath = $FileBrowser.FileName
+    if ($exePath) {
+        Write-Host "Using client path: $exePath" -ForegroundColor Green
+        return $exePath
+    } else {
+        Write-Warning -Message "No client specified, exiting."
+        exit
+    }
+}
 
 Write-Host "====================================" -ForegroundColor Cyan
 Write-Host "======= Maple2 Setup Script ========" -ForegroundColor Cyan
@@ -33,8 +102,8 @@ Write-Host "====================================" -ForegroundColor Cyan
 $dotnetVersion = (Get-Command dotnet -ErrorAction SilentlyContinue).FileVersionInfo.ProductVersion
 
 if ($dotnetVersion -lt "8.0") {
-	Write-Host "Please install .Net 8.0 and run this script again." -ForegroundColor Red
-	Start-Process "https://dotnet.microsoft.com/en-us/download/dotnet/8.0"
+    Write-Host "Please install .Net 8.0 and run this script again." -ForegroundColor Red
+    Start-Process "https://dotnet.microsoft.com/en-us/download/dotnet/8.0"
     exit
 }
 
@@ -46,53 +115,74 @@ if (Test-Path .env) {
     Copy-Item .env.example .env
 }
 
-# Get the path to the client
-$FileBrowser = New-Object System.Windows.Forms.OpenFileDialog -Property @{
-    InitialDirectory = [Environment]::GetFolderPath('Desktop')
-    Filter = "MapleStory2.exe|MapleStory2.exe"
-    Title = "Maplestory2 Executable"
-}
-$null = $FileBrowser.ShowDialog()
+# Extract the current MS2_DATA_FOLDER value from the .env file, ignoring comments
+$currentDataPath = (Get-Content .env | Select-String -Pattern "MS2_DATA_FOLDER=").Line -replace 'MS2_DATA_FOLDER=', ''
 
-$exePath = $FileBrowser.FileName
-if ($exePath) {
-    Write-Host "Using client path: $exePath" -ForegroundColor Green
-} else {
-    Write-Warning -Message "No client specified, exiting."
-    exit
-}
+# Get the parent directory of the current data path
+$parentPath = Split-Path $currentDataPath -Parent
 
-#Get the parent directory of the client path
-$parentPath = Split-Path $exePath -Parent
-
-# Get the data directory
+# Define the path to the MapleStory2 executable and the data directory
+$exeFileName = "MapleStory2.exe"
+$exeFullPath = Join-Path $parentPath $exeFileName
 $dataPath = Join-Path $parentPath "Data"
-if (-not (Test-Path $dataPath)) {
-    Write-Host "MapleStory2 data directory not found. Did you select the correct client?" -ForegroundColor Red
-    exit
+
+# Check for the executable and data directory
+if (Test-Path $exeFullPath) {
+    Write-Host "Found existing client at: $exeFullPath" -ForegroundColor Green
+} else {
+    Write-Host -Message "No client executable found in the MS2_DATA_FOLDER parent directory." -ForegroundColor Red
+    $exePath = Get-ClientExecutable
+    $parentPath = Split-Path $exePath -Parent
+    $dataPath = Join-Path $parentPath "Data"
 }
 
+# Verify if the data directory exists
+if (-not (Test-Path $dataPath)) {
+    Write-Warning -Message "'Data' directory not found. Please ensure the selected executable is correct." -ForegroundColor Yellow
+    $exePath = Get-ClientExecutable
+    $parentPath = Split-Path $exePath -Parent
+    $dataPath = Join-Path $parentPath "Data"
+}
+
+# Confirm and save the data directory
 Write-Host "MapleStory2 data directory: $dataPath" -ForegroundColor Green
 Write-Host "====================================" -ForegroundColor Cyan
-Write-Host "Saving .env data"
 
-# Remove existing key in the .env file
-(Get-Content .env) | Where-Object { $_ -notmatch "MapleStory2 data directory" } | Set-Content .env
-(Get-Content .env) | Where-Object { $_ -notmatch "MS2_DATA_FOLDER" } | Set-Content .env
+# Check if the new data path is different from the current value before updating
+if ($currentDataPath -ne $dataPath) {
+    Write-Host "Updating MS2_DATA_FOLDER in .env file." -ForegroundColor Green
+    Update-EnvVariable "MS2_DATA_FOLDER" $dataPath
+} else {
+    Write-Host "No change for MS2_DATA_FOLDER, keeping existing value." -ForegroundColor Yellow
+}
 
-# Write to the .env file under the MS2_DATA_FOLDER variable
-Add-Content -Path .env -Value "# MapleStory2 data directory"
-Add-Content -Path .env -Value "MS2_DATA_FOLDER=$dataPath"
+# Check if MySQL service is installed
+$mysqlService = Get-Service -Name "MySQL80" -ErrorAction SilentlyContinue
 
-# Database setup, prompt if they have MySQL setup
-$answer = Read-Host "Do you have MySQL 8.0 installed? (y/n)"
+if ($mysqlService) {
+    # Check if the MySQL service is running
+    if ($mysqlService.Status -eq 'Running') {
+        Write-Host "MySQL is installed and running." -ForegroundColor Green
+    } else {
+        Write-Host "MySQL is installed but the service is not running." -ForegroundColor Yellow
+        exit
+    }
+} else {
+    Write-Host "MySQL is not installed. Please download and install it." -ForegroundColor Red
+    Start-Process "https://dev.mysql.com/downloads/installer/"
+    exit
+}
 
-# if starts with y, prompt for connection details
-if ($answer -eq "y") {
+# Database setup, prompt if they want to change MySQL settings
+$changeSettings = Read-Host "Do you want to change the MySQL settings? (y/n)"
+
+# If user chooses to update MySQL settings
+if ($changeSettings -eq "y") {
+    # Prompt for connection details
     $ip = Read-Host "MySQL host (leave blank for localhost)"
     $port = Read-Host "MySQL port (leave blank for 3306)"
     $user = Read-Host "MySQL user (leave blank for root)"
-    $pass = Read-Host "MySQL password" -AsSecureString
+    $pass = Read-Host "MySQL password"
 
     if ($ip -eq "") {
         $ip = "localhost"
@@ -106,31 +196,19 @@ if ($answer -eq "y") {
         $user = "root"
     }
 
-    if ($pass -eq "") {
-        Write-Host "No password provided, using empty password." -ForegroundColor Yellow
-        $pass = ""
-    }
+    # Update or add DB connection info in the .env file
+    Update-EnvVariable "DB_IP" $ip
+    Update-EnvVariable "DB_PORT" $port
+    Update-EnvVariable "DB_USER" $user
+    Update-EnvVariable "DB_PASSWORD" $pass
 
-    $pass_d = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($pass))
-
-    (Get-Content .env) | Where-Object { $_ -notmatch "Database connection" } | Set-Content .env
-    (Get-Content .env) | Where-Object { $_ -notmatch "DB_IP" } | Set-Content .env
-    (Get-Content .env) | Where-Object { $_ -notmatch "DB_PORT" } | Set-Content .env
-    (Get-Content .env) | Where-Object { $_ -notmatch "DB_USER" } | Set-Content .env
-    (Get-Content .env) | Where-Object { $_ -notmatch "DB_PASSWORD" } | Set-Content .env
-
-    # Write to the .env file under the DB_* variables
-    Add-Content -Path .env -Value "# Database connection"
-    Add-Content -Path .env -Value "DB_IP=$ip"
-    Add-Content -Path .env -Value "DB_PORT=$port"
-    Add-Content -Path .env -Value "DB_USER=$user"
-    Add-Content -Path .env -Value "DB_PASSWORD=$pass_d"
+    Write-Host "MySQL settings updated." -ForegroundColor Green
 } else {
-    Write-Host "Please install MySQL 8.0 and run this script again." -ForegroundColor Red
-    Start-Process "https://dev.mysql.com/downloads/installer/"
-    exit
+    Write-Host "Keeping the existing MySQL settings." -ForegroundColor Yellow
 }
 
+Write-Host "====================================" -ForegroundColor Cyan
+Write-Host "MySQL setup complete."
 Write-Host "====================================" -ForegroundColor Cyan
 Write-Host "Initializing project..." -ForegroundColor Blue
 
@@ -138,19 +216,15 @@ Write-Host "Initializing project..." -ForegroundColor Blue
 Write-Host "You need navmeshes to run the server, you can either generate them or download them from the discord server. Link in README.md." -ForegroundColor Yellow
 Write-Host "Navmesh generation can take up to an hour depending on your system." -ForegroundColor Yellow
 
-# Set the working directory to the Maple2.File.Ingest project
-Set-Location -Path "Maple2.File.Ingest"
-
 $answer = Read-Host "Do you want to skip navmesh generation? (y/n)"
 
-# if starts with y, add argument --skip-navmesh to the dotnet run command
 if ($answer -eq "y") {
-    Invoke-Dotnet -Command "run" -Arguments "--skip-navmesh"
+    $dotnetArguments = "--skip-navmesh"
 } else {
-    Invoke-Dotnet -Command "run" -Arguments "--init"
+    $dotnetArguments = "--init"
 }
 
-Set-Location -Path ".."
+Invoke-Dotnet -Command "run" -Arguments $dotnetArguments -WorkingDirectory "Maple2.File.Ingest"
 
 Write-Host "====================================" -ForegroundColor Cyan
 Write-Host "Done! Happy Mapling!" -ForegroundColor Green
